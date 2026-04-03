@@ -13,6 +13,7 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+from __future__ import annotations
 
 import uuid as sys_uuid
 import typing as tp
@@ -22,7 +23,6 @@ import pytest
 from gcl_iam.tests.functional import clients as iam_clients
 
 from genesis_core.common import constants as c
-
 
 DEF_DOMAIN = "core.internal"
 
@@ -59,8 +59,7 @@ class TestDnsApi:
         assert self._cmp_shallow(domain, output)
         yield output
 
-    # DNS
-
+    @pytest.mark.xdist_group(name="pdns")
     def test_domains_list(
         self,
         user_api_client: iam_clients.GenesisCoreTestRESTClient,
@@ -74,6 +73,7 @@ class TestDnsApi:
         assert response.status_code == 200
         assert len(response.json()) == 0
 
+    @pytest.mark.xdist_group(name="pdns")
     def test_domains_add(
         self,
         user_api_client: iam_clients.GenesisCoreTestRESTClient,
@@ -125,6 +125,7 @@ class TestDnsApi:
         assert response.status_code == 200
         assert len(response.json()) == 0
 
+    @pytest.mark.xdist_group(name="pdns")
     def test_a_record(
         self,
         user_api_client: iam_clients.GenesisCoreTestRESTClient,
@@ -173,6 +174,7 @@ class TestDnsApi:
 
         assert response.status_code == 204
 
+    @pytest.mark.xdist_group(name="pdns")
     def test_txt_record(
         self,
         user_api_client: iam_clients.GenesisCoreTestRESTClient,

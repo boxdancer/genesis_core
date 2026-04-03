@@ -29,7 +29,6 @@ import pytest
 
 from restalchemy.tests.functional import consts as ra_c
 
-
 LOG = logging.getLogger(__name__)
 
 PDNS_BIN = "/usr/sbin/pdns_server"
@@ -44,7 +43,7 @@ def find_free_port():
 
 @pytest.fixture()
 def pdns_server(user_api, tmp_path_factory: pytest.TempPathFactory):
-    result = urlparse(ra_c.DATABASE_URI)
+    result = urlparse(ra_c.get_database_uri())
     if result.scheme != "postgresql":
         pytest.skip("Only PostgreSQL is supported for PowerDNS tests")
     if not os.path.exists(PDNS_BIN):

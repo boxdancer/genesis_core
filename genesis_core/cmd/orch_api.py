@@ -27,7 +27,6 @@ from genesis_core.orch_api.api import app
 from genesis_core.common import config
 from genesis_core.common import log as infra_log
 
-
 api_cli_opts = [
     cfg.StrOpt(
         "bind-host",
@@ -46,13 +45,18 @@ api_cli_opts = [
     ),
     cfg.StrOpt(
         "gc_host",
-        default="10.20.0.2",
+        default="core.local.genesis-core.tech",
         help="GC host",
     ),
-    cfg.IntOpt(
-        "gc_port",
-        default=11011,
-        help="GC port",
+    cfg.StrOpt(
+        "gc_orch_api",
+        default="http://core.local.genesis-core.tech:11011",
+        help="GC orchestrator API",
+    ),
+    cfg.StrOpt(
+        "gc_status_api",
+        default="http://core.local.genesis-core.tech:11012",
+        help="GC status API",
     ),
     cfg.StrOpt(
         "kernel",

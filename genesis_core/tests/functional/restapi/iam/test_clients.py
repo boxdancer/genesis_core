@@ -18,14 +18,20 @@ import uuid as sys_uuid
 
 from bazooka import exceptions as bazooka_exc
 import pytest
+from restalchemy.common import contexts
 
 from genesis_core.tests.functional.restapi.iam import base
-
+from genesis_core.user_api.iam.dm import models as iam_models
 
 TEST_PROJECT_ID = str(sys_uuid.uuid4())
 
 
 class TestClients(base.BaseIamResourceTest):
+    SIGNATURE_ALGORITHM = {
+        "kind": "HS256",
+        "secret_uuid": "00000000-0000-0000-0000-000000000001",
+        "previous_secret_uuid": None,
+    }
 
     def test_create_iam_client_by_admin(
         self, user_api_client, auth_user_admin
@@ -37,7 +43,7 @@ class TestClients(base.BaseIamResourceTest):
             name=iam_client_name,
             client_id="client_id",
             secret="12345678",
-            redirect_url="http://127.0.0.1/",
+            signature_algorithm=self.SIGNATURE_ALGORITHM,
         )
 
         assert iam_client["name"] == iam_client_name
@@ -48,12 +54,18 @@ class TestClients(base.BaseIamResourceTest):
         client = user_api_client(auth_test1_user)
         iam_client_name = "test_client[admin-user]"
 
+        signature_algorithm = {
+            "kind": "HS256",
+            "secret_uuid": "00000000-0000-0000-0000-000000000001",
+            "previous_secret_uuid": None,
+        }
+
         with pytest.raises(bazooka_exc.ForbiddenError):
             client.create_iam_client(
                 name=iam_client_name,
                 client_id="client_id",
                 secret="12345678",
-                redirect_url="http://127.0.0.1/",
+                signature_algorithm=signature_algorithm,
             )
 
     def test_list_iam_clients_by_admin(self, user_api_client, auth_user_admin):
@@ -98,6 +110,28 @@ class TestClients(base.BaseIamResourceTest):
         )
 
         assert result["name"] == new_name
+
+    def test_update_iam_clients_rules_by_admin(
+        self, user_api_client, auth_user_admin
+    ):
+        client = user_api_client(auth_user_admin)
+        iam_client = client.create_iam_client(
+            name="test_client_rules",
+            client_id=f"test_client_id_{sys_uuid.uuid4().hex[:8]}",
+            secret="12345678",
+            signature_algorithm=self.SIGNATURE_ALGORITHM,
+        )
+
+        rules = [{
+            "kind": "admin_bypass",
+            "bypass_users": []
+        }]
+        result = client.update_iam_client(
+            uuid=iam_client["uuid"],
+            rules=rules,
+        )
+
+        assert result["rules"] == rules
 
     def test_update_iam_clients_by_user(
         self, user_api_client, auth_test1_user
@@ -188,6 +222,78 @@ class TestClients(base.BaseIamResourceTest):
 
         assert token_info["refresh_expires_in"] == 1
 
+    def test_logout_deletes_token_from_db(
+        self, user_api_client, auth_test1_user
+    ):
+        client = user_api_client(auth_test1_user)
+        me = client.me()
+
+        assert me["user"]["uuid"] == auth_test1_user.uuid
+
+        logout_url = client.build_resource_uri(
+            [
+                "iam/clients",
+                auth_test1_user.client_uuid,
+                "actions",
+                "logout",
+                "invoke",
+            ]
+        )
+        client.post(url=logout_url)
+
+        with pytest.raises(bazooka_exc.UnauthorizedError):
+            client.me()
+
+    def test_get_token_with_invalid_client_id_error(
+        self, user_api_noauth_client, auth_test1_user
+    ):
+        client = user_api_noauth_client()
+        token_params = auth_test1_user.get_password_auth_params()
+        token_params["client_id"] = "wrong-client-id"
+
+        with pytest.raises(bazooka_exc.UnauthorizedError):
+            client.post(
+                url=auth_test1_user.get_token_url(endpoint=client.endpoint),
+                data=token_params,
+            )
+
+    def test_get_token_with_invalid_client_secret_error(
+        self, user_api_noauth_client, auth_test1_user
+    ):
+        client = user_api_noauth_client()
+        token_params = auth_test1_user.get_password_auth_params()
+        token_params["client_secret"] = "wrong-client-secret"
+
+        with pytest.raises(bazooka_exc.UnauthorizedError):
+            client.post(
+                url=auth_test1_user.get_token_url(endpoint=client.endpoint),
+                data=token_params,
+            )
+
+    def test_get_token_invalid_credentials_no_user_and_wrong_password_same_error(
+        self, user_api_client, auth_test1_user
+    ):
+        client = user_api_client(auth_test1_user)
+        url = auth_test1_user.get_token_url(endpoint=client.endpoint)
+
+        no_user_params = auth_test1_user.get_password_auth_params()
+        no_user_params["username"] = "user_does_not_exist"
+        no_user_params["password"] = "obviously-wrong-password"
+
+        wrong_password_params = auth_test1_user.get_password_auth_params()
+        wrong_password_params["password"] = "obviously-wrong-password"
+
+        with pytest.raises(bazooka_exc.BadRequestError) as no_user_exc:
+            client.post(url=url, data=no_user_params)
+        with pytest.raises(bazooka_exc.BadRequestError) as wrong_password_exc:
+            client.post(url=url, data=wrong_password_params)
+
+        assert type(no_user_exc.value) is type(wrong_password_exc.value)
+        assert not isinstance(no_user_exc.value, bazooka_exc.NotFoundError)
+        assert not isinstance(
+            wrong_password_exc.value, bazooka_exc.NotFoundError
+        )
+
     @pytest.fixture(
         scope="function",
         params=[
@@ -200,7 +306,7 @@ class TestClients(base.BaseIamResourceTest):
         return request.param[0]
 
     def test_get_no_scoped_token_success(
-        self, user_api_client, auth_test1_user, hs256_algorithm
+        self, user_api_client, auth_test1_user, decode_id_token
     ):
         client = user_api_client(auth_test1_user)
         token_params = auth_test1_user.get_password_auth_params()
@@ -210,14 +316,12 @@ class TestClients(base.BaseIamResourceTest):
             data=token_params,
         ).json()
 
-        id_token = hs256_algorithm.decode(
-            token_info["id_token"], ignore_audience=True
-        )
+        id_token = decode_id_token(token_info["id_token"])
         assert token_info["scope"] == ""
         assert id_token["project_id"] is None
 
     def test_get_empty_scoped_token_success(
-        self, user_api_client, auth_test1_user, hs256_algorithm
+        self, user_api_client, auth_test1_user, decode_id_token
     ):
         client = user_api_client(auth_test1_user)
         token_params = auth_test1_user.get_password_auth_params()
@@ -228,14 +332,12 @@ class TestClients(base.BaseIamResourceTest):
             data=token_params,
         ).json()
 
-        id_token = hs256_algorithm.decode(
-            token_info["id_token"], ignore_audience=True
-        )
+        id_token = decode_id_token(token_info["id_token"])
         assert token_info["scope"] == ""
         assert id_token["project_id"] is None
 
     def test_get_scoped_token_no_project_no_organization_success(
-        self, user_api_client, auth_test1_user, hs256_algorithm, scope_test
+        self, user_api_client, auth_test1_user, decode_id_token, scope_test
     ):
         client = user_api_client(auth_test1_user)
         token_params = auth_test1_user.get_password_auth_params()
@@ -246,14 +348,12 @@ class TestClients(base.BaseIamResourceTest):
             data=token_params,
         ).json()
 
-        id_token = hs256_algorithm.decode(
-            token_info["id_token"], ignore_audience=True
-        )
+        id_token = decode_id_token(token_info["id_token"])
         assert token_info["scope"] == scope_test
         assert id_token["project_id"] is None
 
     def test_get_scoped_token_no_project_one_organization_success(
-        self, user_api_client, auth_test1_user, hs256_algorithm, scope_test
+        self, user_api_client, auth_test1_user, decode_id_token, scope_test
     ):
         client = user_api_client(auth_test1_user)
         client.create_organization("OrganizationName1")
@@ -265,14 +365,12 @@ class TestClients(base.BaseIamResourceTest):
             data=token_params,
         ).json()
 
-        id_token = hs256_algorithm.decode(
-            token_info["id_token"], ignore_audience=True
-        )
+        id_token = decode_id_token(token_info["id_token"])
         assert token_info["scope"] == scope_test
         assert id_token["project_id"] is None
 
     def test_get_scoped_token_one_project_one_organization_success(
-        self, user_api_client, auth_test1_user, hs256_algorithm, scope_test
+        self, user_api_client, auth_test1_user, decode_id_token, scope_test
     ):
         client = user_api_client(auth_test1_user)
         org = client.create_organization("OrganizationName1")
@@ -287,14 +385,12 @@ class TestClients(base.BaseIamResourceTest):
             data=token_params,
         ).json()
 
-        id_token = hs256_algorithm.decode(
-            token_info["id_token"], ignore_audience=True
-        )
+        id_token = decode_id_token(token_info["id_token"])
         assert token_info["scope"] == scope_test
         assert id_token["project_id"] == project["uuid"]
 
     def test_get_scoped_token_two_project_two_organization_success(
-        self, user_api_client, auth_test1_user, hs256_algorithm, scope_test
+        self, user_api_client, auth_test1_user, decode_id_token, scope_test
     ):
         client = user_api_client(auth_test1_user)
         org1 = client.create_organization("OrganizationName1")
@@ -313,14 +409,12 @@ class TestClients(base.BaseIamResourceTest):
             data=token_params,
         ).json()
 
-        id_token = hs256_algorithm.decode(
-            token_info["id_token"], ignore_audience=True
-        )
+        id_token = decode_id_token(token_info["id_token"])
         assert token_info["scope"] == scope_test
         assert id_token["project_id"] == project["uuid"]
 
     def test_refresh_token_wo_scope_success(
-        self, user_api_client, auth_test1_user, hs256_algorithm
+        self, user_api_client, auth_test1_user, decode_id_token
     ):
         client = user_api_client(auth_test1_user)
         token_params = auth_test1_user.get_password_auth_params()
@@ -338,19 +432,15 @@ class TestClients(base.BaseIamResourceTest):
             },
         ).json()
 
-        first_id_token = hs256_algorithm.decode(
-            token_info["id_token"], ignore_audience=True
-        )
-        second_id_token = hs256_algorithm.decode(
-            refreshed_token_info["id_token"], ignore_audience=True
-        )
+        first_id_token = decode_id_token(token_info["id_token"])
+        second_id_token = decode_id_token(refreshed_token_info["id_token"])
         assert token_info["scope"] == "test"
         assert first_id_token["project_id"] is None
         assert refreshed_token_info["scope"] == "test"
         assert second_id_token["project_id"] is None
 
     def test_refresh_to_scoped_token_one_project_one_organization_success(
-        self, user_api_client, auth_test1_user, hs256_algorithm, scope_test
+        self, user_api_client, auth_test1_user, decode_id_token, scope_test
     ):
         client = user_api_client(auth_test1_user)
         org = client.create_organization("OrganizationName1")
@@ -372,12 +462,8 @@ class TestClients(base.BaseIamResourceTest):
             },
         ).json()
 
-        first_id_token = hs256_algorithm.decode(
-            token_info["id_token"], ignore_audience=True
-        )
-        second_id_token = hs256_algorithm.decode(
-            refreshed_token_info["id_token"], ignore_audience=True
-        )
+        first_id_token = decode_id_token(token_info["id_token"])
+        second_id_token = decode_id_token(refreshed_token_info["id_token"])
         assert token_info["scope"] == ""
         assert first_id_token["project_id"] is None
         assert refreshed_token_info["scope"] == scope_test

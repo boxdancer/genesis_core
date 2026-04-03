@@ -16,9 +16,8 @@
 
 import typing as tp
 import uuid as sys_uuid
-from importlib.metadata import entry_points
+from importlib.metadata import EntryPoint, entry_points
 
-from gcl_iam import algorithms
 from gcl_sdk.events import clients as sdk_clients
 from gcl_sdk.agents.universal import utils as sdk_utils
 from restalchemy.common import contexts
@@ -33,22 +32,25 @@ def node_uuid(path: str = c.NODE_UUID_PATH) -> sys_uuid.UUID:
 
 
 def load_from_entry_point(group: str, name: str) -> tp.Any:
-    """Load class from entry points."""
-    for ep in entry_points():
-        if ep.group == group and ep.name == name:
-            return ep.load()
-
+    """Load class from entry points using standard importlib.metadata API."""
+    eps = entry_points()
+    selected = eps.select(group=group, name=name)
+    selected_list = list(selected)
+    if selected_list:
+        return selected_list[0].load()
+    
     raise RuntimeError(f"No class '{name}' found in entry points {group}")
 
 
-def load_group_from_entry_point(group: str) -> tp.Any:
-    """Load class from entry points."""
-    return [e for e in entry_points(group=group)]
+def load_group_from_entry_point(group: str) -> tp.List[EntryPoint]:
+    """Load all entry points from a group using standard importlib.metadata API."""
+    eps = entry_points()
+    return list(eps.select(group=group))
 
 
 def get_context_storage(
     global_salt: str,
-    token_algorithm: algorithms.AbstractAlgorithm,
+    hs256_jwks_encryption_key: str,
     events_client: sdk_clients.AbstractEventClient,
 ) -> contexts.Storage:
     return contexts.Storage(
@@ -57,8 +59,8 @@ def get_context_storage(
                 "value": global_salt,
                 "read_only": True,
             },
-            iam_c.STORAGE_KEY_IAM_TOKEN_ENCRYPTION_ALGORITHM: {
-                "value": token_algorithm,
+            iam_c.STORAGE_KEY_IAM_HS256_JWKS_ENCRYPTION_KEY: {
+                "value": hs256_jwks_encryption_key,
                 "read_only": True,
             },
             iam_c.STORAGE_KEY_EVENTS_CLIENT: {

@@ -1,4 +1,4 @@
-#    Copyright 2025 Genesis Corporation.
+#    Copyright 2025-2026 Genesis Corporation.
 #
 #    All Rights Reserved.
 #
@@ -13,6 +13,7 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+from __future__ import annotations
 
 import errno
 from os import path as os_path
@@ -29,6 +30,7 @@ from restalchemy.api import controllers
 from restalchemy.api import resources
 from restalchemy.common import contexts
 from restalchemy.common import exceptions as ra_e
+from restalchemy.common import utils as ra_utils
 from restalchemy.dm import filters as ra_filters
 from restalchemy.openapi import utils as oa_utils
 import pyotp
@@ -38,6 +40,7 @@ from genesis_core.user_api.iam.clients import idp
 from genesis_core.user_api.iam.dm import models
 from genesis_core.user_api.iam import constants as c
 from genesis_core.user_api.iam import exceptions as iam_e
+from genesis_core.user_api.iam.validation import ClientRequestValidator
 
 
 class EnforceMixin:
@@ -127,6 +130,7 @@ class UserController(
         process_filters=True,
         hidden_fields=resources.HiddenFieldMap(
             get=[
+                "user_source",
                 "salt",
                 "secret_hash",
                 "secret",
@@ -142,6 +146,7 @@ class UserController(
                 "confirmation_code_made_at",
             ],
             update=[
+                "user_source",
                 "salt",
                 "secret_hash",
                 "secret",
@@ -150,6 +155,7 @@ class UserController(
                 "confirmation_code_made_at",
             ],
             filter=[
+                "user_source",
                 "salt",
                 "secret_hash",
                 "secret",
@@ -158,6 +164,7 @@ class UserController(
                 "confirmation_code_made_at",
             ],
             action_post=[
+                "user_source",
                 "salt",
                 "secret_hash",
                 "secret",
@@ -170,6 +177,11 @@ class UserController(
     )
 
     def create(self, **kwargs):
+        self.enforce(
+            c.PERMISSION_USER_CREATE,
+            do_raise=True,
+            exc=iam_e.CanNotCreateUser,
+        )
         self.validate_secret(kwargs)
         kwargs.pop("email_verified", None)
         user = super().create(**kwargs)
@@ -366,6 +378,33 @@ class OrganizationMemberController(
         convert_underscore=False,
     )
 
+    def create(self, organization, **kwargs):
+        if not (
+            organization.are_i_owner()
+            or self.enforce(c.PERMISSION_ORGANIZATION_WRITE_ALL)
+        ):
+            raise iam_e.CanNotUpdateOrganization(name=organization.name)
+
+        return super().create(organization=organization, **kwargs)
+
+    def update(self, uuid, **kwargs):
+        member = super().get(uuid)
+        organization = member.organization
+        if organization.are_i_owner() or self.enforce(
+            c.PERMISSION_ORGANIZATION_WRITE_ALL
+        ):
+            return super().update(uuid, **kwargs)
+        raise iam_e.CanNotUpdateOrganization(name=organization.name)
+
+    def delete(self, uuid):
+        member = super().get(uuid)
+        organization = member.organization
+        if organization.are_i_owner() or self.enforce(
+            c.PERMISSION_ORGANIZATION_WRITE_ALL
+        ):
+            return super().delete(uuid)
+        raise iam_e.CanNotUpdateOrganization(name=organization.name)
+
 
 class ProjectController(
     controllers.BaseResourceControllerPaginated, EnforceMixin
@@ -375,8 +414,17 @@ class ProjectController(
         convert_underscore=False,
     )
 
-    def create(self, **kwargs):
-        project = super().create(**kwargs)
+    def create(self, organization, **kwargs):
+        if not (
+            organization.are_i_owner()
+            or self.enforce(c.PERMISSION_PROJECT_WRITE_ALL)
+            or self.enforce(c.PERMISSION_ORGANIZATION_WRITE_ALL)
+        ):
+            raise iam_e.CanNotCreateProjectInOrganization(
+                uuid=organization.uuid
+            )
+
+        project = super().create(organization=organization, **kwargs)
         project.add_owner(models.User.me())
         return project
 
@@ -474,14 +522,57 @@ class PermissionBindingController(
     __policy_name__ = "permission_binding"
 
 
+class WellKnownController(
+    controllers.BaseNestedResourceController,
+    EnforceMixin,
+):
+
+    def get(self, parent_resource, uuid):
+        return parent_resource.get_wellknown_info()
+
+    def filter(self, parent_resource, **kwargs):
+        return ["openid-configuration"]
+
+
 class IdpController(
-    iam_controllers.PolicyBasedWithoutProjectController,
     controllers.BaseResourceControllerPaginated,
+    EnforceMixin,
 ):
     __resource__ = resources.ResourceByRAModel(
         models.Idp,
         convert_underscore=False,
     )
+
+    def create(self, **kwargs):
+        if self.enforce(c.PERMISSION_IDP_CREATE):
+            return super().create(**kwargs)
+        raise iam_e.CanNotCreateIdp(
+            name=kwargs.get("name", ""),
+            rule=c.PERMISSION_IDP_CREATE,
+        )
+
+    def filter(self, filters, **kwargs):
+        if self.enforce(c.PERMISSION_IDP_READ_ALL):
+            return super().filter(filters, **kwargs)
+        raise iam_e.CanNotListIdps(
+            rule=c.PERMISSION_IDP_READ_ALL,
+        )
+
+    def update(self, uuid, **kwargs):
+        if self.enforce(c.PERMISSION_IDP_UPDATE):
+            return super().update(uuid, **kwargs)
+        raise iam_e.CanNotUpdateIdp(
+            uuid=uuid,
+            rule=c.PERMISSION_IDP_UPDATE,
+        )
+
+    def delete(self, uuid):
+        if self.enforce(c.PERMISSION_IDP_DELETE):
+            return super().delete(uuid)
+        raise iam_e.CanNotDeleteIdp(
+            uuid=uuid,
+            rule=c.PERMISSION_IDP_DELETE,
+        )
 
     def _get_request_params(self, resource):
         return {
@@ -516,6 +607,28 @@ class IdpController(
         return None, 307, [("Location", auth_url)]
 
     @actions.get
+    def authorize(
+        self,
+        resource,
+        client_id,
+        redirect_uri,
+        state,
+        response_type,
+        nonce,
+        scope,
+    ):
+        redirect_uri = resource.authorize(
+            client_id=client_id,
+            redirect_uri=redirect_uri,
+            state=state,
+            response_type=response_type,
+            nonce=nonce,
+            scope=scope,
+        )
+
+        return None, 307, [("Location", redirect_uri)]
+
+    @actions.get
     def callback(self, resource, state, session_state, iss, code):
 
         idp_client = idp.IdpClient(resource.well_known_endpoint)
@@ -533,7 +646,7 @@ class IdpController(
 
 
 class ClientsController(
-    controllers.BaseResourceControllerPaginated, EnforceMixin
+    controllers.BaseResourceControllerPaginated, EnforceMixin, ValidateSecretMixin
 ):
     __resource__ = resources.ResourceByModelWithCustomProps(
         models.IamClient,
@@ -628,13 +741,16 @@ class ClientsController(
                 client_id=client_id,
                 client_secret=client_secret,
             )
+            ctx = contexts.get_context()
             payload = dict(
                 password=kwargs.get(c.PARAM_PASSWORD),
                 scope=kwargs.get(c.PARAM_SCOPE, ""),
                 ttl=kwargs.get(c.PARAM_TTL, None),
                 refresh_ttl=kwargs.get(c.PARAM_REFRESH_TTL, None),
                 otp_code=self._req.headers.get(c.HEADER_OTP_CODE, None),
-                root_endpoint=resource.redirect_url,
+                root_endpoint=ra_utils.lastslash(
+                    ctx.get_real_url_with_prefix(),
+                ),
             )
             login_attr, token_getter = grant_type_map[grant_type]
             payload[login_attr] = kwargs.get(login_attr)
@@ -642,16 +758,20 @@ class ClientsController(
                 raise ra_e.ValidationErrorException()
 
             token = token_getter(**payload)
-            return token.get_response_body()
 
         elif grant_type == c.GRANT_TYPE_REFRESH_TOKEN:
             token = resource.get_token_by_refresh_token(
                 refresh_token=kwargs.get("refresh_token"),
                 scope=kwargs.get(c.PARAM_SCOPE, None),
             )
-            return token.get_response_body()
+        elif grant_type == c.GRANT_TYPE_AUTHORIZATION_CODE:
+            token = resource.get_token_by_authorization_code(
+                code=kwargs.get(c.PARAM_CODE),
+                redirect_uri=kwargs.get(c.PARAM_REDIRECT_URI),
+            )
         else:
             raise iam_e.InvalidGrantType(grant_type=grant_type)
+        return token.get_response_body()
 
     @actions.get
     def introspect(self, resource):
@@ -661,6 +781,10 @@ class ClientsController(
     def me(self, resource):
         return resource.me().get_response_body()
 
+    @actions.get
+    def userinfo(self, resource):
+        return resource.userinfo().get_response_body()
+
     @actions.post
     def reset_password(self, resource, email=None):
         email = email or self._req.params.get("email")
@@ -668,6 +792,36 @@ class ClientsController(
         resource.send_reset_password_event(
             email=email, app_endpoint=app_endpoint
         )
+
+    @actions.post
+    def logout(self, resource):
+        token = models.Token.my()
+        token.delete()
+        return {}
+
+    @actions.get
+    def jwks(self, resource):
+        return resource.get_jwks()
+
+
+class ClientUserCreationController(
+    controllers.BaseResourceControllerPaginated,
+    EnforceMixin,
+    ValidateSecretMixin,
+):
+    """Controller for create_user action that returns User model."""
+    # Reference to existing User resource to avoid duplicate registration
+    __resource__ = UserController.__resource__
+    
+    _validator = ClientRequestValidator()
+
+    @actions.post
+    def create_user(self, resource, **kwargs):
+        """Creates a user via IamClient.create_user action."""
+        self._validator.validate(resource, self._req)
+        self.validate_secret(kwargs)
+        app_endpoint = _get_app_endpoint(req=self._req)
+        return resource.create_user(app_endpoint=app_endpoint, **kwargs)
 
 
 class WebController:
@@ -744,3 +898,30 @@ class IamWebController(WebController):
     def do(self, path, parent_resource=None):
         request_context = self._build_request_context()
         return self._build_response(path.lstrip("/"), request_context)
+
+
+class AuthorizationInfoController(controllers.BaseResourceControllerPaginated):
+    __resource__ = resources.ResourceByRAModel(
+        models.IdpAuthorizationInfo,
+        convert_underscore=False,
+        hidden_fields=[
+            "idp",
+            "state",
+            "nonce",
+            "code",
+            "response_type",
+            "token",
+        ],
+    )
+
+    @actions.post
+    def confirm(self, resource, redirect_me=None):
+        resource.confirm()
+        callback_uri = resource.construct_callback_uri()
+
+        if redirect_me:
+            return None, 307, [("Location", callback_uri)]
+
+        return {
+            "redirect_url": callback_uri,
+        }

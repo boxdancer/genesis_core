@@ -1,4 +1,4 @@
-#    Copyright 2025 Genesis Corporation.
+#    Copyright 2025-2026 Genesis Corporation.
 #
 #    All Rights Reserved.
 #
@@ -23,40 +23,56 @@ import uuid as sys_uuid
 import pytest
 import netaddr
 from gcl_iam import algorithms
+from gcl_iam import tokens
 from gcl_iam.tests.functional import clients as iam_clients
 from gcl_sdk.events import clients as sdk_clients
+from gcl_sdk.infra.dm import models as sdk_infra_models
+from gcl_sdk.agents.universal.dm import models as sdk_ua_models
+from restalchemy.dm import filters as dm_filters
+from restalchemy.tests.functional.conftest import setup_db_for_worker
 
 from genesis_core.common import constants as c
+from genesis_core.common.dm import targets as ct
 from genesis_core.common import utils
 from genesis_core.compute import constants as nc
 from genesis_core.compute.dm import models as node_models
 from genesis_core.compute.node_set.dm import models as node_set_models
 from genesis_core.user_api.api import app as user_app
+from genesis_core.user_api.iam import constants as iam_c
 from genesis_core.tests.functional import utils as test_utils
 from genesis_core.config.dm import models as conf_models
 from genesis_core.config import constants as cc
 from genesis_core.secret import constants as sc
 from genesis_core.secret.dm import models as secret_models
+from genesis_core.user_api.iam import drivers as user_drivers
 from genesis_core.user_api.iam.dm import models as iam_models
 
 FIRST_MIGRATION = "0000-root-d34de1.py"
 
 
 @pytest.fixture(scope="session")
-def hs256_algorithm():
-    secret = os.getenv("HS256_KEY", c.DEFAULT_HS256_KEY)
-    return algorithms.HS256(key=secret)
+def context_storage():
+    hs256_jwks_encryption_key = os.getenv(
+        "HS256_JWKS_ENCRYPTION_KEY",
+        c.DEFAULT_HS256_JWKS_ENCRYPTION_KEY,
+    )
+    return utils.get_context_storage(
+        global_salt=os.getenv("GLOBAL_SALT", c.DEFAULT_GLOBAL_SALT),
+        hs256_jwks_encryption_key=hs256_jwks_encryption_key,
+        events_client=sdk_clients.DummyEventClient(),
+    )
 
 
 @pytest.fixture(scope="session")
-def context_storage(
-    hs256_algorithm: algorithms.AbstractAlgorithm,
-):
-    return utils.get_context_storage(
-        global_salt=os.getenv("GLOBAL_SALT", c.DEFAULT_GLOBAL_SALT),
-        token_algorithm=hs256_algorithm,
-        events_client=sdk_clients.DummyEventClient(),
-    )
+def decode_id_token():
+    driver = user_drivers.DirectDriver()
+
+    def _decode(token: str):
+        unverified = tokens.UnverifiedToken(token)
+        algorithm = driver.get_algorithm(unverified)
+        return algorithm.decode(token, ignore_audience=True)
+
+    return _decode
 
 
 @pytest.fixture(scope="session")
@@ -85,12 +101,14 @@ def default_client_uuid():
 
 
 @pytest.fixture(scope="module")
-def user_api_service(hs256_algorithm, context_storage):
+def user_api_service(context_storage):
+    iam_engine_driver = user_drivers.DirectDriver()
+
     class ApiRestService(test_utils.RestServiceTestCase):
         __FIRST_MIGRATION__ = FIRST_MIGRATION
         __APP__ = user_app.build_wsgi_application(
             context_storage=context_storage,
-            token_algorithm=hs256_algorithm,
+            iam_engine_driver=iam_engine_driver,
         )
 
     rest_service = ApiRestService()
@@ -136,7 +154,12 @@ def auth_test1_user(
     default_client_secret: str,
 ):
     password = "test1test"
-    client = user_api_client(auth_user_admin)
+    client = user_api_client(
+        auth_user_admin,
+        permissions=[
+            iam_c.PERMISSION_USER_CREATE,
+        ],
+    )
     user = client.create_user(username="test1", password=password)
     user_obj = iam_models.User.objects.get_one(filters={"uuid": user["uuid"]})
     client.confirm_email(
@@ -164,7 +187,12 @@ def auth_test2_user(
     default_client_secret: str,
 ):
     password = "test2test"
-    client = user_api_client(auth_user_admin)
+    client = user_api_client(
+        auth_user_admin,
+        permissions=[
+            iam_c.PERMISSION_USER_CREATE,
+        ],
+    )
     user = client.create_user(username="test2", password=password)
     user_obj = iam_models.User.objects.get_one(filters={"uuid": user["uuid"]})
     client.confirm_email(
@@ -192,7 +220,12 @@ def auth_test1_p1_user(
     default_client_secret: str,
 ):
     password = "testtest1p1"
-    client = user_api_client(auth_user_admin)
+    client = user_api_client(
+        auth_user_admin,
+        permissions=[
+            iam_c.PERMISSION_USER_CREATE,
+        ],
+    )
     user = client.create_user(username="test1p1", password=password)
     user_obj = iam_models.User.objects.get_one(filters={"uuid": user["uuid"]})
     client.confirm_email(
@@ -290,11 +323,11 @@ def user_api_client(user_api, auth_user_admin):
         project_id: str = None,
     ):
         permissions = permissions or []
-        client = iam_clients.GenesisCoreTestRESTClient(
+        client = iam_clients.GenericAutoRefreshRESTClient(
             f"{user_api.get_endpoint()}v1/",
             auth,
         )
-        admin_client = iam_clients.GenesisCoreTestRESTClient(
+        admin_client = iam_clients.GenericAutoRefreshRESTClient(
             f"{user_api.get_endpoint()}v1/",
             auth_user_admin,
         )
@@ -318,27 +351,6 @@ def user_api_noauth_client(user_api):
 
 
 @pytest.fixture
-def machine_agent_factory():
-    def factory(
-        uuid: sys_uuid.UUID | None = None,
-        name: str = "agent",
-        status: str = nc.MachineAgentStatus.ACTIVE.value,
-        **kwargs,
-    ) -> tp.Dict[str, tp.Any]:
-        uuid = uuid or sys_uuid.uuid4()
-        obj = node_models.MachineAgent(
-            uuid=uuid,
-            name=name,
-            status=status,
-            **kwargs,
-        )
-        view = obj.dump_to_simple_view()
-        return view
-
-    return factory
-
-
-@pytest.fixture
 def node_factory():
     def factory(
         uuid: sys_uuid.UUID | None = None,
@@ -347,21 +359,26 @@ def node_factory():
         ram: int = 1024,
         image: str = "ubuntu_24.04",
         project_id: sys_uuid.UUID = c.SERVICE_PROJECT_ID,
-        status: str = nc.NodeStatus.NEW.value,
+        status: str | None = None,
         **kwargs,
     ) -> tp.Dict[str, tp.Any]:
         uuid = uuid or sys_uuid.uuid4()
+        status_value = (
+            nc.NodeStatus.NEW.value if status is None else status.value
+        )
         node = node_models.Node(
             uuid=uuid,
             name=name,
             cores=cores,
             ram=ram,
-            image=image,
             project_id=project_id,
-            status=status,
+            status=status_value,
+            disk_spec=sdk_infra_models.RootDiskSpec(image=image),
             **kwargs,
         )
         view = node.dump_to_simple_view()
+        if status is None:
+            view.pop("status")
         view.pop("node_set")
         return view
 
@@ -391,6 +408,7 @@ def node_set_factory():
             replicas=replicas,
             project_id=project_id,
             status=status,
+            disk_spec=sdk_infra_models.SetRootDiskSpec(image=image),
             **kwargs,
         )
         view = obj.dump_to_simple_view()
@@ -406,7 +424,7 @@ def pool_factory():
         agent: sys_uuid.UUID | None = None,
         name: str = "pool-default",
         driver_spec: dict | None = None,
-        status: str = nc.MachinePoolStatus.ACTIVE.value,
+        status: str | None = None,
         avail_cores: int = 8,
         avail_ram: int = 16384,
         all_cores: int = 8,
@@ -417,19 +435,33 @@ def pool_factory():
         driver_spec = (
             {"driver": "libvirt"} if driver_spec is None else driver_spec
         )
+        status_value = (
+            nc.MachinePoolStatus.ACTIVE.value if status is None else status
+        )
+        storage_pool = node_models.ThinStoragePool(
+            pool_type="dummy",
+            capacity_usable=1000,
+            capacity_provisioned=0,
+            oversubscription_ratio=1.0,
+            available_actual=1000,
+        )
+
         pool = node_models.MachinePool(
             uuid=uuid,
             agent=agent,
             name=name,
-            status=status,
+            status=status_value,
             driver_spec=driver_spec,
             avail_cores=avail_cores,
             avail_ram=avail_ram,
             all_cores=all_cores,
             all_ram=all_ram,
+            storage_pools=[storage_pool],
             **kwargs,
         )
         view = pool.dump_to_simple_view()
+        if status is None:
+            view.pop("status")
         return view
 
     return factory
@@ -481,7 +513,7 @@ def config_factory():
         **kwargs,
     ) -> tp.Dict[str, tp.Any]:
         uuid = uuid or sys_uuid.uuid4()
-        target = conf_models.NodeTarget.from_node(target_node)
+        target = ct.NodeTarget.from_node(target_node)
         body = conf_models.TextBodyConfig.from_text(content_body)
         if on_change_cmd is None:
             on_change = conf_models.OnChangeNoAction()
@@ -617,7 +649,7 @@ def ssh_key_factory():
         **kwargs,
     ) -> tp.Dict[str, tp.Any]:
         uuid = uuid or sys_uuid.uuid4()
-        target = conf_models.NodeTarget.from_node(target_node)
+        target = ct.NodeTarget.from_node(target_node)
         constructor = (
             secret_models.PlainSecretConstructor()
             if constructor is None
@@ -648,20 +680,30 @@ def ssh_key_factory():
 
 
 @pytest.fixture
-def builder_factory() -> tp.Callable:
+def pool_builder_factory() -> tp.Callable:
     def factory(
         uuid: sys_uuid.UUID | None = None,
         status: str = nc.BuilderStatus.ACTIVE.value,
         **kwargs,
-    ) -> tp.Dict[str, tp.Any]:
+    ) -> sdk_ua_models.UniversalAgent:
         uuid = uuid or sys_uuid.uuid4()
-        builder = node_models.Builder(
+        agent = sdk_ua_models.UniversalAgent(
             uuid=uuid,
+            capabilities={
+                "capabilities": [
+                    "builder_pool",
+                    "builder_pool_machine",
+                    "builder_pool_volume",
+                ]
+            },
+            facts={"facts": []},
+            name=f"compute_pool_builder_{str(uuid)[:8]}",
+            node=sys_uuid.uuid4(),
             status=status,
             **kwargs,
         )
-        view = builder.dump_to_simple_view()
-        return view
+
+        return agent
 
     return factory
 
@@ -710,24 +752,6 @@ def machine_pool_reservation_factory() -> tp.Callable:
     return factory
 
 
-@pytest.fixture
-def default_machine_agent(
-    user_api_client: iam_clients.GenesisCoreTestRESTClient,
-    auth_user_admin: iam_clients.GenesisCoreAuth,
-    machine_agent_factory: tp.Callable,
-):
-    uuid = sys_uuid.UUID("00000000-1110-0000-0000-000000000000")
-    default_agent = machine_agent_factory(uuid=uuid)
-    client = user_api_client(auth_user_admin)
-    url = client.build_collection_uri(["machine_agents"])
-    client.post(url, json=default_agent)
-
-    yield default_agent
-
-    url = client.build_resource_uri(["machine_agents", uuid])
-    client.delete(url)
-
-
 @pytest.fixture()
 def default_pool(
     pool_factory: tp.Callable,
@@ -737,8 +761,14 @@ def default_pool(
     uuid = sys_uuid.UUID("00000000-1111-0000-0000-000000000000")
     default_pool = pool_factory(uuid=uuid)
     client = user_api_client(auth_user_admin)
-    url = client.build_collection_uri(["hypervisors"])
+    url = client.build_collection_uri(["compute", "hypervisors"])
     client.post(url, json=default_pool)
+
+    pool = node_models.MachinePool.objects.get_one(
+        filters={"uuid": dm_filters.EQ(uuid)}
+    )
+    pool.status = "ACTIVE"
+    pool.save()
 
     return default_pool
 
@@ -752,12 +782,12 @@ def default_node(
     uuid = sys_uuid.UUID("00000000-1112-0000-0000-000000000000")
     default_node = node_factory(uuid=uuid)
     client = user_api_client(auth_user_admin)
-    url = client.build_collection_uri(["nodes"])
+    url = client.build_collection_uri(["compute", "nodes"])
     client.post(url, json=default_node)
 
     yield default_node
 
-    url = client.build_resource_uri(["nodes", uuid])
+    url = client.build_resource_uri(["compute", "nodes", uuid])
     client.delete(url)
 
 
@@ -793,3 +823,47 @@ def default_subnet(
     subnet.insert()
 
     return subnet
+
+
+@pytest.fixture
+def default_machine_agent(
+    user_api_client: iam_clients.GenesisCoreTestRESTClient,
+    auth_user_admin: iam_clients.GenesisCoreAuth,
+) -> dict[str, tp.Any]:
+    uuid = sys_uuid.UUID("00000000-1112-0100-0000-000000000211")
+    agent = sdk_ua_models.UniversalAgent(
+        uuid=uuid,
+        capabilities={"capabilities": ["pool", "pool_volume", "pool_machine"]},
+        facts={"facts": []},
+        name="machine_agent",
+        node=sys_uuid.UUID("00000000-1112-1100-0000-000000000000"),
+        status="ACTIVE",
+    )
+    agent.insert()
+
+    return agent.dump_to_simple_view()
+
+
+@pytest.fixture
+def default_pool_builder(
+    user_api_client: iam_clients.GenesisCoreTestRESTClient,
+    auth_user_admin: iam_clients.GenesisCoreAuth,
+) -> dict[str, tp.Any]:
+    uuid = sys_uuid.UUID("00000000-1112-0100-0000-000000000322")
+    agent = sdk_ua_models.UniversalAgent(
+        uuid=uuid,
+        capabilities={
+            "capabilities": [
+                "builder_pool",
+                "builder_pool_machine",
+                "builder_pool_volume",
+            ]
+        },
+        facts={"facts": []},
+        name="compute_pool_builder_default",
+        node=sys_uuid.UUID("00000000-1112-1100-0000-000000000000"),
+        status="ACTIVE",
+    )
+    agent.insert()
+
+    return agent.dump_to_simple_view()

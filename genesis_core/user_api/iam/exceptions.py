@@ -1,4 +1,4 @@
-# Copyright 2025 Genesis Corporation
+# Copyright 2025-2026 Genesis Corporation
 #
 # All Rights Reserved.
 #
@@ -29,6 +29,13 @@ class CanNotSetOwner(exceptions.CommonForbiddenException, iam_exc.Forbidden):
         " the owner. This action requires the `{rule}` permission, which is"
         " not granted. Please contact your administrator to request the"
         " necessary access or retain the current owner value."
+    )
+
+
+class CanNotCreateUser(exceptions.CommonForbiddenException, iam_exc.Forbidden):
+    __template__ = (
+        "The current user is not permitted to create users. This action"
+        " requires the `{rule}`, which has not been granted."
     )
 
 
@@ -126,7 +133,7 @@ class CanNotCreateProjectInOrganization(
 ):
     __template__ = (
         "The current user is not permitted to create a project in the"
-        " organization `{name}`. Only the owner of the organization may"
+        " organization `{uuid}`. Only the owner of the organization may"
         " create projects."
     )
 
@@ -170,8 +177,71 @@ class CanNotDeleteIamClient(
     )
 
 
+class CanNotCreateIdp(exceptions.CommonForbiddenException, iam_exc.Forbidden):
+    __template__ = (
+        "The current user is not permitted to create an IDP `{name}`."
+        " This action requires the `{rule}`, which has not been granted."
+    )
+
+
+class CanNotListIdps(exceptions.CommonForbiddenException, iam_exc.Forbidden):
+    __template__ = (
+        "The current user is not permitted to list IDPs."
+        " This action requires the `{rule}`, which has not been granted."
+    )
+
+
+class CanNotUpdateIdp(exceptions.CommonForbiddenException, iam_exc.Forbidden):
+    __template__ = (
+        "The current user is not permitted to update IDP `{uuid}`."
+        " This action requires the `{rule}`, which has not been granted."
+    )
+
+
+class CanNotDeleteIdp(exceptions.CommonForbiddenException, iam_exc.Forbidden):
+    __template__ = (
+        "The current user is not permitted to delete IDP `{uuid}`."
+        " This action requires the `{rule}`, which has not been granted."
+    )
+
+
 class InvalidGrantType(
     exceptions.CommonValueErrorException,
     iam_exc.InvalidGrantTypeError,
 ):
     __template__ = "Invalid grant type: {grant_type}"
+
+
+class InvalidClientId(
+    exceptions.CommonValueErrorException,
+    iam_exc.InvalidGrantTypeError,
+):
+    __template__ = "Invalid or unknown client_id: {client_id}"
+
+
+class InvalidRedirectUri(
+    exceptions.CommonValueErrorException,
+    iam_exc.InvalidGrantTypeError,
+):
+    __template__ = "Invalid or unregistered redirect_uri: {redirect_uri}"
+
+
+class AdminBypassValidationFailed(
+    exceptions.CommonForbiddenException,
+    iam_exc.Forbidden,
+):
+    __template__ = "Admin bypass validation failed."
+
+
+class CaptchaValidationFailed(
+    exceptions.CommonForbiddenException,
+    iam_exc.Forbidden,
+):
+    __template__ = "CAPTCHA validation failed: {message}"
+
+
+class FirebaseAppCheckValidationFailed(
+    exceptions.CommonForbiddenException,
+    iam_exc.Forbidden,
+):
+    __template__ = "Firebase App Check verification failed: {message}"
